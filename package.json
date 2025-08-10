@@ -1,7 +1,8 @@
 {
-	"name": "metadata-worker",
+	"name": "metadata-scraper",
 	"version": "0.0.0",
 	"private": true,
+	"main": "src/index.ts",
 	"scripts": {
 		"deploy": "wrangler deploy",
 		"dev": "wrangler dev",
@@ -14,5 +15,8 @@
 		"typescript": "^5.5.2",
 		"vitest": "~3.2.0",
 		"wrangler": "^4.28.1"
+	},
+	"dependencies": {
+		"open-graph-scraper": "^6.10.0"
 	}
 }
