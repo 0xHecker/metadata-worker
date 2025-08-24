@@ -15,6 +15,16 @@ export default {
 			});
 		}
 
+		// Edge cache: 1-week TTL keyed by full request URL
+		let cacheKey: Request | undefined;
+		if (request.method === 'GET') {
+			cacheKey = new Request(request.url, request);
+			const cached = await caches.default.match(cacheKey);
+			if (cached) {
+				return cached;
+			}
+		}
+
 		const urls = urlsToScrapeQuery.split(',').slice(0, 10);
 
 		try {
@@ -35,9 +45,16 @@ export default {
 				})
 			);
 
-			return new Response(JSON.stringify(results), {
-				headers: { 'Content-Type': 'application/json' },
+			const res = new Response(JSON.stringify(results), {
+				headers: {
+					'Content-Type': 'application/json',
+					'Cache-Control': 'public, max-age=604800'
+				},
 			});
+			if (cacheKey) {
+				ctx.waitUntil(caches.default.put(cacheKey, res.clone()));
+			}
+			return res;
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : String(error);
 			return new Response(JSON.stringify({ error: errorMessage }), {
