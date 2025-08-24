@@ -31,7 +31,7 @@ export default {
 
 					const html = await response.text();
 					const { result } = await ogs({ html });
-					return result;
+					return { url, ...result };
 				})
 			);
 
