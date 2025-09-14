@@ -3,6 +3,31 @@ import { userAgents } from "./user-agents";
 
 let userAgentIndex = 0;
 
+const twitterUserAgents = userAgents.filter((ua) => ua.toLowerCase().includes('twitterbot'));
+
+function isTwitterHost(hostname: string): boolean {
+	hostname = hostname.toLowerCase();
+	return hostname === 'twitter.com' || hostname.endsWith('.twitter.com') || hostname === 'x.com' || hostname.endsWith('.x.com');
+}
+
+function selectUserAgent(targetUrl: string): string {
+	try {
+		const hostname = new URL(targetUrl).hostname;
+		if (isTwitterHost(hostname)) {
+			if (twitterUserAgents.length > 0) {
+				const randomIndex = Math.floor(Math.random() * twitterUserAgents.length);
+				return twitterUserAgents[randomIndex];
+			}
+			return 'Twitterbot/1.0';
+		}
+	} catch (_) {
+		// Fallback to rotation for malformed URLs
+	}
+	const ua = userAgents[userAgentIndex];
+	userAgentIndex = (userAgentIndex + 1) % userAgents.length;
+	return ua;
+}
+
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const { searchParams } = new URL(request.url);
@@ -30,12 +55,11 @@ export default {
 		try {
 			const results = await Promise.all(
 				urls.map(async (url) => {
-					const currentUserAgent = userAgents[userAgentIndex];
-					userAgentIndex = (userAgentIndex + 1) % userAgents.length;
+					const userAgent = selectUserAgent(url);
 
 					const response = await fetch(url, {
 						headers: {
-							'User-Agent': currentUserAgent,
+							'User-Agent': userAgent,
 						},
 					});
 
