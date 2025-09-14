@@ -28,10 +28,48 @@ function selectUserAgent(targetUrl: string): string {
 	return ua;
 }
 
+const TEN_DAYS_SECONDS = 864000;
+const CACHE_CONTROL_VALUE = `public, s-maxage=${TEN_DAYS_SECONDS}, max-age=${TEN_DAYS_SECONDS}`;
+
+async function buildResponse(urls: string[]): Promise<Response> {
+	const results = await Promise.all(
+		urls.map(async (url) => {
+			const userAgent = selectUserAgent(url);
+			const response = await fetch(url, {
+				headers: {
+					'User-Agent': userAgent,
+				},
+			});
+			const html = await response.text();
+			const { result } = await ogs({ html });
+			return { url, ...result };
+		})
+	);
+
+	return new Response(JSON.stringify(results), {
+		headers: {
+			'Content-Type': 'application/json',
+			'Cache-Control': CACHE_CONTROL_VALUE,
+		},
+	});
+}
+
+async function cachePut(request: Request, response: Response): Promise<void> {
+	const cache = caches.default;
+	const headers = new Headers(response.headers);
+	headers.set('Cache-Control', CACHE_CONTROL_VALUE);
+	const cachedResponse = new Response(response.body, {
+		status: response.status,
+		statusText: response.statusText,
+		headers,
+	});
+	await cache.put(request, cachedResponse);
+}
+
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-		const { searchParams } = new URL(request.url);
-		const urlsToScrapeQuery = searchParams.get('url');
+		const url = new URL(request.url);
+		const urlsToScrapeQuery = url.searchParams.get('url');
 
 		if (!urlsToScrapeQuery) {
 			return new Response(JSON.stringify({ error: "Please provide a 'url' query parameter." }), {
@@ -40,45 +78,30 @@ export default {
 			});
 		}
 
-		// Edge cache: 1-week TTL keyed by full request URL
-		let cacheKey: Request | undefined;
-		if (request.method === 'GET') {
-			cacheKey = new Request(request.url, request);
-			const cached = await caches.default.match(cacheKey);
-			if (cached) {
-				return cached;
-			}
-		}
-
 		const urls = urlsToScrapeQuery.split(',').slice(0, 10);
 
 		try {
-			const results = await Promise.all(
-				urls.map(async (url) => {
-					const userAgent = selectUserAgent(url);
-
-					const response = await fetch(url, {
-						headers: {
-							'User-Agent': userAgent,
-						},
-					});
-
-					const html = await response.text();
-					const { result } = await ogs({ html });
-					return { url, ...result };
-				})
-			);
-
-			const res = new Response(JSON.stringify(results), {
-				headers: {
-					'Content-Type': 'application/json',
-					'Cache-Control': 'public, max-age=604800'
-				},
-			});
-			if (cacheKey) {
-				ctx.waitUntil(caches.default.put(cacheKey, res.clone()));
+			// 1) Cache bust via ?re=1 (GET only)
+			if (url.searchParams.has('re') && request.method === 'GET') {
+				const freshResponse = await buildResponse(urls);
+				ctx.waitUntil(cachePut(request, freshResponse.clone()));
+				return freshResponse;
 			}
-			return res;
+
+			// 2) Try Cloudflare cache first (GET only)
+			if (request.method === 'GET') {
+				const cached = await caches.default.match(request);
+				if (cached) {
+					return cached;
+				}
+			}
+
+			// 3) No cache hit: compute and cache (GET only)
+			const originResponse = await buildResponse(urls);
+			if (request.method === 'GET') {
+				ctx.waitUntil(cachePut(request, originResponse.clone()));
+			}
+			return originResponse;
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : String(error);
 			return new Response(JSON.stringify({ error: errorMessage }), {
