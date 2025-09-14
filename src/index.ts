@@ -43,7 +43,9 @@ async function getOgDataForUrl(baseRequestUrl: string, targetUrl: string, refres
 	if (!refresh) {
 		const cached = await cache.match(cacheKey);
 		if (cached) {
-			return await cached.json();
+			const data = (await cached.json()) as Record<string, unknown>;
+			console.log(`[cache:HIT] ${targetUrl}`);
+			return { ...data, isCachedResponse: true } as Record<string, unknown>;
 		}
 	}
 
@@ -64,7 +66,8 @@ async function getOgDataForUrl(baseRequestUrl: string, targetUrl: string, refres
 	const cacheResponse = new Response(JSON.stringify(data), { headers });
 	await cache.put(cacheKey, cacheResponse);
 
-	return data;
+	console.log(`[cache:MISS] ${targetUrl}`);
+	return { ...data, isCachedResponse: false } as Record<string, unknown>;
 }
 
 async function buildResponse(urls: string[], baseRequestUrl: string, refresh: boolean): Promise<Response> {
