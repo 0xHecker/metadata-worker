@@ -30,22 +30,43 @@ function selectUserAgent(targetUrl: string): string {
 
 const TEN_DAYS_SECONDS = 864000;
 const CACHE_CONTROL_VALUE = `public, s-maxage=${TEN_DAYS_SECONDS}, max-age=${TEN_DAYS_SECONDS}`;
+const KV_PREFIX = 'og:v1:';
 
 function buildPerUrlCacheKey(baseRequestUrl: string, targetUrl: string): Request {
 	const keyUrl = new URL(`/__og-cache?u=${encodeURIComponent(targetUrl)}`, baseRequestUrl);
 	return new Request(keyUrl.toString());
 }
 
-async function getOgDataForUrl(baseRequestUrl: string, targetUrl: string, refresh: boolean): Promise<Record<string, unknown>> {
+function buildKvKey(targetUrl: string): string {
+	return `${KV_PREFIX}${targetUrl}`;
+}
+
+async function getOgDataForUrl(env: Env, ctx: ExecutionContext, baseRequestUrl: string, targetUrl: string, refresh: boolean): Promise<Record<string, unknown>> {
 	const cache = caches.default;
 	const cacheKey = buildPerUrlCacheKey(baseRequestUrl, targetUrl);
+	const kvKey = buildKvKey(targetUrl);
 
 	if (!refresh) {
 		const cached = await cache.match(cacheKey);
 		if (cached) {
 			const data = (await cached.json()) as Record<string, unknown>;
-			console.log(`[cache:HIT] ${targetUrl}`);
 			return { ...data, isCachedResponse: true } as Record<string, unknown>;
+		}
+
+		// Try KV global cache next
+		const kvValue = await env.KV.get(kvKey);
+		if (kvValue) {
+			try {
+				const data = JSON.parse(kvValue) as Record<string, unknown>;
+				const headers = new Headers({
+					'Content-Type': 'application/json',
+					'Cache-Control': CACHE_CONTROL_VALUE,
+				});
+				ctx.waitUntil(cache.put(cacheKey, new Response(JSON.stringify(data), { headers })));
+				return { ...data, isCachedResponse: true } as Record<string, unknown>;
+			} catch (_) {
+				// Corrupt KV entry, treat as miss
+			}
 		}
 	}
 
@@ -63,15 +84,18 @@ async function getOgDataForUrl(baseRequestUrl: string, targetUrl: string, refres
 		'Content-Type': 'application/json',
 		'Cache-Control': CACHE_CONTROL_VALUE,
 	});
-	const cacheResponse = new Response(JSON.stringify(data), { headers });
-	await cache.put(cacheKey, cacheResponse);
+	ctx.waitUntil(
+		Promise.all([
+			cache.put(cacheKey, new Response(JSON.stringify(data), { headers })),
+			env.KV.put(kvKey, JSON.stringify(data), { expirationTtl: TEN_DAYS_SECONDS }),
+		])
+	);
 
-	console.log(`[cache:MISS] ${targetUrl}`);
 	return { ...data, isCachedResponse: false } as Record<string, unknown>;
 }
 
-async function buildResponse(urls: string[], baseRequestUrl: string, refresh: boolean): Promise<Response> {
-	const results = await Promise.all(urls.map((u) => getOgDataForUrl(baseRequestUrl, u, refresh)));
+async function buildResponse(env: Env, ctx: ExecutionContext, urls: string[], baseRequestUrl: string, refresh: boolean): Promise<Response> {
+	const results = await Promise.all(urls.map((u) => getOgDataForUrl(env, ctx, baseRequestUrl, u, refresh)));
 	return new Response(JSON.stringify(results), {
 		headers: {
 			'Content-Type': 'application/json',
@@ -96,7 +120,7 @@ export default {
 
 		try {
 			const refresh = url.searchParams.has('re') && request.method === 'GET';
-			const response = await buildResponse(urls, request.url, refresh);
+			const response = await buildResponse(env, ctx, urls, request.url, refresh);
 			return response;
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : String(error);
