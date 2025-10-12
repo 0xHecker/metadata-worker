@@ -29,6 +29,13 @@
 	],
 	"vars": {
 		"R2_PUBLIC_BASE": "https://bucket.vibesearch.app"
+	},
+	"env": {
+		"dev": {
+			"vars": {
+				"R2_PUBLIC_BASE": "https://preview-bucket.vibesearch.app"
+			}
+		}
 	}
 	/**
 	 * Smart Placement
