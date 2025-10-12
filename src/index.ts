@@ -52,22 +52,78 @@ function normalizePublicBase(value: string | undefined): string | undefined {
 	return `https://${value.replace(/\/$/, '')}`;
 }
 
-async function ensureR2Image(env: Env, key: string, imageUrl: string): Promise<boolean> {
+async function sha256(str: string): Promise<string> {
+	const te = new TextEncoder();
+	const digest = await crypto.subtle.digest('SHA-256', te.encode(str));
+	return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function ensureR2Image(
+	env: Env,
+	key: string,
+	imageUrl: string,
+	userAgent: string,
+	referer: string,
+	refreshImage: boolean
+): Promise<boolean> {
 	const r2 = (env as unknown as { R2?: R2Bucket }).R2;
 	if (!r2) return false;
-	const head = await r2.head(key);
-	if (head) return true;
-	const res = await fetch(imageUrl);
-	if (!res.ok) return false;
+
+	if (!refreshImage) {
+		const head = await r2.head(key);
+		if (head) return true;
+	}
+	console.log(`Downloading image from: ${imageUrl}`);
+	const res = await fetch(imageUrl, {
+		headers: {
+			'User-Agent': userAgent,
+			Referer: referer,
+			Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+			'Accept-Language': 'en-US,en;q=0.9',
+			'Accept-Encoding': 'gzip, deflate, br',
+			Connection: 'keep-alive',
+			'Upgrade-Insecure-Requests': '1',
+			'Sec-Fetch-Dest': 'document',
+			'Sec-Fetch-Mode': 'navigate',
+			'Sec-Fetch-Site': 'cross-site',
+			'Sec-Fetch-User': '?1',
+		},
+	});
+	if (!res.ok) {
+		console.error(`Failed to fetch image from ${imageUrl}. Status: ${res.status} ${res.statusText}`);
+		return false;
+	}
+	const buffer = await res.arrayBuffer();
+	console.log(`Image size: ${buffer.byteLength} bytes`);
+	const firstBytes = new Uint8Array(buffer.slice(0, 16));
+	const hexSignature = Array.from(firstBytes)
+		.map((b) => b.toString(16).padStart(2, '0'))
+		.join(' ');
+	console.log(`Raw image signature (first 16 bytes): ${hexSignature}`);
+	if (buffer.byteLength === 0) {
+		console.error('Downloaded image buffer is empty, aborting R2 upload.');
+		return false;
+	}
 	const contentType = res.headers.get('content-type') || 'application/octet-stream';
-	await r2.put(key, res.body || (await res.arrayBuffer()), { httpMetadata: { contentType } });
-	return true;
+	console.log(`Uploading to R2 with content-type: ${contentType}`);
+	try {
+		await r2.put(key, buffer, {
+			httpMetadata: { contentType },
+		});
+		return true;
+	} catch (e) {
+		console.error(`Failed to upload to R2 for key ${key}: ${(e as Error).message}`);
+		return false;
+	}
 }
 
 async function rewriteInstagramImagesToR2(
 	env: Env,
 	ctx: ExecutionContext,
-	resultObj: Record<string, unknown>
+	resultObj: Record<string, unknown>,
+	originalUserAgent: string,
+	refererUrl: string,
+	refreshImage: boolean
 ): Promise<Record<string, unknown>> {
 	const publicBase = normalizePublicBase((env as unknown as { R2_PUBLIC_BASE?: string }).R2_PUBLIC_BASE);
 	const processField = async (field: 'ogImage' | 'twitterImage') => {
@@ -78,10 +134,12 @@ async function rewriteInstagramImagesToR2(
 				const obj = (item as Record<string, unknown>) || {};
 				const urlVal = obj['url'];
 				if (typeof urlVal !== 'string' || urlVal.length === 0) return obj;
-				const key = `igimg/${encodeURIComponent(urlVal)}`;
-				// Ensure present in R2 before rewriting to avoid 404s
-				if (publicBase && (await ensureR2Image(env, key, urlVal))) {
-					return { ...obj, url: `${publicBase}/${key}` };
+				console.log(`Original Instagram OG Image URL: ${urlVal}`);
+				const key = `igimg/${await sha256(urlVal)}.jpg`;
+				if (publicBase && (await ensureR2Image(env, key, urlVal, originalUserAgent, refererUrl, refreshImage))) {
+					const r2Url = `${publicBase}/${key}`;
+					console.log(`Rewriting to R2 URL: ${r2Url}`);
+					return { ...obj, url: r2Url };
 				}
 				return obj;
 			})
@@ -98,7 +156,8 @@ async function getOgDataForUrl(
 	ctx: ExecutionContext,
 	baseRequestUrl: string,
 	targetUrl: string,
-	refresh: boolean
+	refresh: boolean,
+	refreshImage: boolean
 ): Promise<Record<string, unknown>> {
 	const cache = caches.default;
 	const cacheKey = buildPerUrlCacheKey(baseRequestUrl, targetUrl);
@@ -142,7 +201,7 @@ async function getOgDataForUrl(
 	try {
 		const hostname = new URL(targetUrl).hostname;
 		if (isInstagramHost(hostname)) {
-			resultObj = await rewriteInstagramImagesToR2(env, ctx, resultObj);
+			resultObj = await rewriteInstagramImagesToR2(env, ctx, resultObj, userAgent, targetUrl, refreshImage);
 		}
 	} catch (_) {
 		// best-effort only
@@ -171,8 +230,15 @@ async function getOgDataForUrl(
 	return { ...data, isCachedResponse: false } as Record<string, unknown>;
 }
 
-async function buildResponse(env: Env, ctx: ExecutionContext, urls: string[], baseRequestUrl: string, refresh: boolean): Promise<Response> {
-	const results = await Promise.all(urls.map((u) => getOgDataForUrl(env, ctx, baseRequestUrl, u, refresh)));
+async function buildResponse(
+	env: Env,
+	ctx: ExecutionContext,
+	urls: string[],
+	baseRequestUrl: string,
+	refresh: boolean,
+	refreshImage: boolean
+): Promise<Response> {
+	const results = await Promise.all(urls.map((u) => getOgDataForUrl(env, ctx, baseRequestUrl, u, refresh, refreshImage)));
 	return new Response(JSON.stringify(results), {
 		headers: {
 			'Content-Type': 'application/json',
@@ -193,14 +259,19 @@ export default {
 			});
 		}
 
-		const urls = urlsToScrapeQuery.split(',').slice(0, 10);
+		const urls = urlsToScrapeQuery
+			.split(',')
+			.slice(0, 10)
+			.map((u) => u.trim().replace(/^https?:\/\/https?:\/\//, 'https://'));
 
 		try {
 			const refresh = url.searchParams.has('re') && request.method === 'GET';
-			const response = await buildResponse(env, ctx, urls, request.url, refresh);
+			const refreshImage = url.searchParams.get('img') === '1' && request.method === 'GET';
+			const response = await buildResponse(env, ctx, urls, request.url, refresh, refreshImage);
 			return response;
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : String(error);
+			console.error(errorMessage);
 			return new Response(JSON.stringify({ error: errorMessage }), {
 				status: 500,
 				headers: { 'Content-Type': 'application/json' },

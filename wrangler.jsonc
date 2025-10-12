@@ -16,18 +16,19 @@
 	"kv_namespaces": [
 		{
 			"binding": "KV",
-			"id": "ad38586626d8479dbb7771dd734d42b5"
-			// "preview_id": "<ID_OF_PREVIEW_KV_NAMESPACE_FOR_LOCAL_DEVELOPMENT>"
+			"id": "ad38586626d8479dbb7771dd734d42b5",
+			"preview_id": "0ad868ea29714b968e93f2e6b8aa2ce3"
 		}
 	],
 	"r2_buckets": [
 		{
 			"binding": "R2",
-			"bucket_name": "vibesearch"
+			"bucket_name": "vibesearch",
+			"preview_bucket_name": "vibesearch-preview"
 		}
 	],
 	"vars": {
-		"R2_PUBLIC_BASE": "bucket.vibesearch.app"
+		"R2_PUBLIC_BASE": "https://bucket.vibesearch.app"
 	}
 	/**
 	 * Smart Placement
