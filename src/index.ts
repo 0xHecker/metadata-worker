@@ -250,19 +250,16 @@ async function buildResponse(
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
-		const urlsToScrapeQuery = url.searchParams.get('url');
+		const urlsToScrape = url.searchParams.getAll('url');
 
-		if (!urlsToScrapeQuery) {
-			return new Response(JSON.stringify({ error: "Please provide a 'url' query parameter." }), {
+		if (urlsToScrape.length === 0) {
+			return new Response(JSON.stringify({ error: "Please provide at least one 'url' query parameter." }), {
 				status: 400,
 				headers: { 'Content-Type': 'application/json' },
 			});
 		}
 
-		const urls = urlsToScrapeQuery
-			.split(',')
-			.slice(0, 10)
-			.map((u) => u.trim().replace(/^https?:\/\/https?:\/\//, 'https://'));
+		const urls = urlsToScrape.slice(0, 10).map((u) => u.trim().replace(/^https?:\/\/https?:\/\//, 'https://'));
 
 		try {
 			const refresh = url.searchParams.has('re') && request.method === 'GET';
