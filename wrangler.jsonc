@@ -33,7 +33,8 @@
 	"env": {
 		"dev": {
 			"vars": {
-				"R2_PUBLIC_BASE": "https://preview-bucket.vibesearch.app"
+				"R2_PUBLIC_BASE": "https://preview-bucket.vibesearch.app",
+				"ALLOW_UNAUTH_IMPORT_MEDIA": "1"
 			}
 		}
 	}

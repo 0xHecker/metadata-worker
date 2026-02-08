@@ -5,5 +5,7 @@ declare namespace Cloudflare {
 		KV: KVNamespace;
 		R2: R2Bucket;
 		R2_PUBLIC_BASE?: string;
+		IMPORT_MEDIA_TOKEN?: string;
+		ALLOW_UNAUTH_IMPORT_MEDIA?: string;
 	}
 }

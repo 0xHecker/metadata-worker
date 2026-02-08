@@ -36,6 +36,298 @@ function selectUserAgent(targetUrl: string): string {
 const TEN_DAYS_SECONDS = 864000;
 const CACHE_CONTROL_VALUE = `public, s-maxage=${TEN_DAYS_SECONDS}, max-age=${TEN_DAYS_SECONDS}`;
 const KV_PREFIX = 'og:v1:';
+const IMPORT_MEDIA_UPLOAD_PATH = '/import-media';
+const IMPORT_MAX_UPLOAD_BYTES = 60 * 1024 * 1024;
+const IMPORT_TOKEN_HEADER = 'X-VS-Import-Token';
+
+const corsHeaders = {
+	'Access-Control-Allow-Origin': '*',
+	'Access-Control-Allow-Headers': `Content-Type, X-VS-Source-Url, X-VS-File-Name, ${IMPORT_TOKEN_HEADER}`,
+	'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+};
+
+type RemoteMediaUploadBody = {
+	remoteUrl: string;
+	sourcePageUrl?: string;
+	fileName?: string;
+};
+
+const mediaMimeAllowList = ['image/', 'video/', 'audio/'];
+
+function appendCorsHeaders(headers: Headers) {
+	for (const [key, value] of Object.entries(corsHeaders)) {
+		headers.set(key, value);
+	}
+}
+
+function jsonResponse(data: unknown, init?: ResponseInit): Response {
+	const headers = new Headers(init?.headers || {});
+	headers.set('Content-Type', 'application/json');
+	appendCorsHeaders(headers);
+	return new Response(JSON.stringify(data), {
+		...init,
+		headers,
+	});
+}
+
+function isHttpUrl(url: string): boolean {
+	try {
+		const parsed = new URL(url);
+		return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+	} catch {
+		return false;
+	}
+}
+
+function normalizeMimeType(value: string | null | undefined): string {
+	if (!value) return '';
+	return value.split(';')[0].trim().toLowerCase();
+}
+
+function isAllowedMediaMime(mimeType: string): boolean {
+	return mediaMimeAllowList.some((prefix) => mimeType.startsWith(prefix));
+}
+
+function extensionFromMimeType(mimeType: string): string {
+	const map: Record<string, string> = {
+		'image/jpeg': 'jpg',
+		'image/jpg': 'jpg',
+		'image/png': 'png',
+		'image/webp': 'webp',
+		'image/gif': 'gif',
+		'image/avif': 'avif',
+		'image/svg+xml': 'svg',
+		'video/mp4': 'mp4',
+		'video/webm': 'webm',
+		'video/ogg': 'ogv',
+		'audio/mpeg': 'mp3',
+		'audio/mp3': 'mp3',
+		'audio/mp4': 'm4a',
+		'audio/ogg': 'ogg',
+		'audio/wav': 'wav',
+		'audio/webm': 'webm',
+	};
+	return map[mimeType] || 'bin';
+}
+
+function extensionFromUrl(url: string): string | null {
+	try {
+		const pathname = new URL(url).pathname;
+		const last = pathname.split('/').pop() || '';
+		const clean = last.split('?')[0].split('#')[0];
+		const extension = clean.includes('.') ? clean.split('.').pop() : '';
+		if (!extension) return null;
+		return extension.toLowerCase().slice(0, 12);
+	} catch {
+		return null;
+	}
+}
+
+function extensionFromFileName(fileName?: string): string | null {
+	if (!fileName) return null;
+	const clean = fileName.trim().split('/').pop() || '';
+	if (!clean.includes('.')) return null;
+	return clean.split('.').pop()?.toLowerCase().slice(0, 12) || null;
+}
+
+function timingSafeEqual(a: string, b: string): boolean {
+	if (a.length !== b.length) return false;
+	let mismatch = 0;
+	for (let i = 0; i < a.length; i++) {
+		mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+	}
+	return mismatch === 0;
+}
+
+function isMediaImportAuthenticated(request: Request, env: Env): boolean {
+	const configuredToken = `${(env as any).IMPORT_MEDIA_TOKEN || ''}`.trim();
+	const allowUnauth = `${(env as any).ALLOW_UNAUTH_IMPORT_MEDIA || '1'}` !== '0';
+	if (!configuredToken) {
+		return allowUnauth;
+	}
+	const providedToken = `${request.headers.get(IMPORT_TOKEN_HEADER) || ''}`.trim();
+	if (!providedToken) return false;
+	return timingSafeEqual(providedToken, configuredToken);
+}
+
+async function sha256Buffer(buffer: ArrayBuffer): Promise<string> {
+	const digest = await crypto.subtle.digest('SHA-256', buffer);
+	return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function buildMediaKey(params: {
+	hash: string;
+	contentType: string;
+	explicitExtension?: string | null;
+	kind: 'remote' | 'binary';
+}): string {
+	const now = new Date();
+	const yyyy = now.getUTCFullYear().toString().padStart(4, '0');
+	const mm = `${now.getUTCMonth() + 1}`.padStart(2, '0');
+	const dd = `${now.getUTCDate()}`.padStart(2, '0');
+	const extension = params.explicitExtension || extensionFromMimeType(params.contentType);
+	const token = `${params.hash.slice(0, 22)}-${Date.now().toString(36)}`;
+	return `imports/${params.kind}/${yyyy}/${mm}/${dd}/${token}.${extension}`;
+}
+
+function resolvePublicR2Url(env: Env, key: string): string | null {
+	const publicBase = normalizePublicBase(env.R2_PUBLIC_BASE);
+	if (!publicBase) return null;
+	return `${publicBase}/${key}`;
+}
+
+async function uploadRemoteMediaToR2(
+	env: Env,
+	requestBody: RemoteMediaUploadBody
+): Promise<{
+	key: string;
+	contentType: string;
+	publicUrl: string | null;
+	size: number;
+}> {
+	const remoteUrl = requestBody.remoteUrl;
+	const sourcePageUrl = requestBody.sourcePageUrl || remoteUrl;
+	const fileNameExt = extensionFromFileName(requestBody.fileName);
+	const urlExt = extensionFromUrl(remoteUrl);
+	const userAgent = selectUserAgent(remoteUrl);
+
+	const response = await fetch(remoteUrl, {
+		headers: {
+			'User-Agent': userAgent,
+			Referer: sourcePageUrl,
+			Accept: '*/*',
+		},
+		signal: AbortSignal.timeout(20_000),
+	});
+
+	if (!response.ok) {
+		throw new Error(`Remote fetch failed (${response.status})`);
+	}
+
+	const contentType = normalizeMimeType(response.headers.get('content-type'));
+	if (!contentType || !isAllowedMediaMime(contentType)) {
+		throw new Error(`Unsupported media content type: ${contentType || 'unknown'}`);
+	}
+
+	const contentLengthHeader = response.headers.get('content-length');
+	const contentLength = contentLengthHeader ? Number(contentLengthHeader) : 0;
+	if (Number.isFinite(contentLength) && contentLength > IMPORT_MAX_UPLOAD_BYTES) {
+		throw new Error('Media is larger than the configured upload limit.');
+	}
+
+	const hash = await sha256(remoteUrl);
+	const key = buildMediaKey({
+		hash,
+		contentType,
+		explicitExtension: fileNameExt || urlExt,
+		kind: 'remote',
+	});
+
+	await env.R2.put(key, response.body, {
+		httpMetadata: { contentType },
+	});
+
+	const stored = await env.R2.head(key);
+	return {
+		key,
+		contentType,
+		publicUrl: resolvePublicR2Url(env, key),
+		size: stored?.size || contentLength || 0,
+	};
+}
+
+async function uploadBinaryToR2(env: Env, request: Request): Promise<{
+	key: string;
+	contentType: string;
+	publicUrl: string | null;
+	size: number;
+}> {
+	const contentType = normalizeMimeType(request.headers.get('content-type'));
+	const fileNameExt = extensionFromFileName(request.headers.get('X-VS-File-Name') || undefined);
+	const buffer = await request.arrayBuffer();
+	if (!buffer || buffer.byteLength === 0) {
+		throw new Error('Binary payload is empty.');
+	}
+	if (buffer.byteLength > IMPORT_MAX_UPLOAD_BYTES) {
+		throw new Error('Binary payload exceeds max upload size.');
+	}
+
+	const resolvedType = isAllowedMediaMime(contentType) ? contentType : 'image/png';
+	const hash = await sha256Buffer(buffer);
+	const key = buildMediaKey({
+		hash,
+		contentType: resolvedType,
+		explicitExtension: fileNameExt,
+		kind: 'binary',
+	});
+	await env.R2.put(key, buffer, {
+		httpMetadata: { contentType: resolvedType },
+	});
+	const stored = await env.R2.head(key);
+	return {
+		key,
+		contentType: resolvedType,
+		publicUrl: resolvePublicR2Url(env, key),
+		size: stored?.size || buffer.byteLength,
+	};
+}
+
+async function handleMediaImport(request: Request, env: Env): Promise<Response> {
+	if (request.method === 'OPTIONS') {
+		return new Response(null, {
+			status: 204,
+			headers: {
+				...corsHeaders,
+			},
+		});
+	}
+
+	if (request.method !== 'POST') {
+		return jsonResponse({ error: 'Method not allowed.' }, { status: 405 });
+	}
+	if (!isMediaImportAuthenticated(request, env)) {
+		return jsonResponse({ error: 'UNAUTHORIZED_IMPORT_UPLOAD' }, { status: 401 });
+	}
+
+	try {
+		const contentType = normalizeMimeType(request.headers.get('content-type'));
+
+		if (contentType === 'application/json') {
+			const body = (await request.json()) as RemoteMediaUploadBody;
+			if (!body?.remoteUrl || !isHttpUrl(body.remoteUrl)) {
+				return jsonResponse({ error: 'remoteUrl must be a valid http(s) URL.' }, { status: 400 });
+			}
+			const uploaded = await uploadRemoteMediaToR2(env, body);
+			return jsonResponse({
+				success: true,
+				storageType: 's3',
+				key: uploaded.key,
+				url: uploaded.publicUrl,
+				contentType: uploaded.contentType,
+				size: uploaded.size,
+				remoteUrl: body.remoteUrl,
+				sourcePageUrl: body.sourcePageUrl || null,
+				uploadedAt: Date.now(),
+			});
+		}
+
+		const uploaded = await uploadBinaryToR2(env, request);
+		return jsonResponse({
+			success: true,
+			storageType: 's3',
+			key: uploaded.key,
+			url: uploaded.publicUrl,
+			contentType: uploaded.contentType,
+			size: uploaded.size,
+			sourcePageUrl: request.headers.get('X-VS-Source-Url') || null,
+			uploadedAt: Date.now(),
+		});
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		console.error('Media import failed:', message);
+		return jsonResponse({ error: message }, { status: 500 });
+	}
+}
 
 function buildPerUrlCacheKey(baseRequestUrl: string, targetUrl: string): Request {
 	// Use fixed base for cache key consistency if needed, but here we follow the request
@@ -267,13 +559,13 @@ async function buildResponse(
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
+		if (url.pathname === IMPORT_MEDIA_UPLOAD_PATH) {
+			return handleMediaImport(request, env);
+		}
 		const urlsToScrape = url.searchParams.getAll('url');
 
 		if (urlsToScrape.length === 0) {
-			return new Response(JSON.stringify({ error: "Please provide at least one 'url' query parameter." }), {
-				status: 400,
-				headers: { 'Content-Type': 'application/json' },
-			});
+			return jsonResponse({ error: "Please provide at least one 'url' query parameter." }, { status: 400 });
 		}
 
 		const urls = urlsToScrape.slice(0, 10).map((u) => u.trim().replace(/^https?:\/\/https?:\/\//, 'https://'));
@@ -281,15 +573,13 @@ export default {
 		try {
 			const refresh = url.searchParams.has('re') && request.method === 'GET';
 			const refreshImage = url.searchParams.get('img') === '1' && request.method === 'GET';
-			const response = await buildResponse(env, ctx, urls, request.url, refresh, refreshImage);
-			return response;
-		} catch (error) {
-			const errorMessage = error instanceof Error ? error.message : String(error);
-			console.error(errorMessage);
-			return new Response(JSON.stringify({ error: errorMessage }), {
-				status: 500,
-				headers: { 'Content-Type': 'application/json' },
-			});
-		}
-	},
-};
+				const response = await buildResponse(env, ctx, urls, request.url, refresh, refreshImage);
+				appendCorsHeaders(response.headers);
+				return response;
+			} catch (error) {
+				const errorMessage = error instanceof Error ? error.message : String(error);
+				console.error(errorMessage);
+				return jsonResponse({ error: errorMessage }, { status: 500 });
+			}
+		},
+	};
