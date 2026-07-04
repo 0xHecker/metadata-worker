@@ -27,15 +27,66 @@
 			"preview_bucket_name": "vibesearch-preview"
 		}
 	],
+	"queues": {
+		"producers": [
+			{
+				"binding": "METADATA_QUEUE",
+				"queue": "metadata-jobs"
+			}
+		],
+		"consumers": [
+			{
+				"queue": "metadata-jobs",
+				"max_batch_size": 5,
+				"max_batch_timeout": 5,
+				"max_retries": 2,
+				"retry_delay": 30,
+				"dead_letter_queue": "metadata-jobs-dlq"
+			}
+		]
+	},
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "METADATA_DOMAIN_THROTTLE",
+				"class_name": "MetadataDomainThrottle"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": [
+				"MetadataDomainThrottle"
+			]
+		}
+	],
 	"vars": {
-		"R2_PUBLIC_BASE": "https://bucket.vibesearch.app"
+		"PROXY_FALLBACK_STATUSES": "403,407,408,409,425,429,451,503,520,521,522,523,524"
 	},
 	"env": {
 		"dev": {
+			"queues": {
+				"producers": [
+					{
+						"binding": "METADATA_QUEUE",
+						"queue": "metadata-jobs-dev"
+					}
+				],
+				"consumers": [
+					{
+						"queue": "metadata-jobs-dev",
+						"max_batch_size": 5,
+						"max_batch_timeout": 5,
+						"max_retries": 2,
+						"retry_delay": 30,
+						"dead_letter_queue": "metadata-jobs-dev-dlq"
+					}
+				]
+			},
 			"vars": {
-				"R2_PUBLIC_BASE": "https://preview-bucket.vibesearch.app",
 				"ALLOW_UNAUTH_IMPORT_MEDIA": "1",
-				"IMPORT_MEDIA_TOKEN": "tJeMlyTSsK"
+				"PROXY_FALLBACK_STATUSES": "403,407,408,409,425,429,451,503,520,521,522,523,524"
 			}
 		}
 	}

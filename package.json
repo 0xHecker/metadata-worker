@@ -18,6 +18,7 @@
 		"wrangler": "^4.28.1"
 	},
 	"dependencies": {
-		"open-graph-scraper": "^6.10.0"
+		"cf-fetch-socks": "^0.2.2",
+		"open-graph-scraper": "6.10.0"
 	}
 }
